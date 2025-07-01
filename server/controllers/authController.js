@@ -1,252 +1,201 @@
 // server/controllers/authController.js
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const { User, Doctor, AuditLog } = require('../models');
-const { AUDIT_ACTIONS } = require('../config/constants');
+const { validationResult } = require('express-validator');
+const AuthService = require('../services/authService');
 
-// Generar token JWT
-const generateToken = (user) => {
-  return jwt.sign(
-    { 
-      userId: user.id, 
-      email: user.email, 
-      role: user.role 
-    },
-    process.env.JWT_SECRET,
-    { 
-      expiresIn: process.env.JWT_EXPIRES_IN || '24h' 
-    }
-  );
-};
+/**
+ * Controlador de autenticación - API v1
+ * Maneja login, logout, cambio de contraseña y perfil de usuario
+ * Delega la lógica de negocio al AuthService
+ */
 
-// Login de usuario
+/**
+ * Login de usuario
+ * @route POST /api/v1/auth/login
+ * @access Public
+ */
 exports.login = async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    // Validar que se proporcionen email y password
-    if (!email || !password) {
+    // Verificar errores de validación
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
       return res.status(400).json({
-        error: 'Email y contraseña son requeridos'
+        success: false,
+        error: 'Datos de entrada inválidos',
+        details: errors.array()
       });
     }
 
-    // Buscar usuario por email
-    const user = await User.findOne({
-      where: { 
-        email: email.toLowerCase(),
-        is_active: true 
-      },
-      include: [
-        {
-          model: Doctor,
-          as: 'doctorProfile',
-          required: false
-        }
-      ]
-    });
-
-    if (!user) {
-      return res.status(401).json({
-        error: 'Credenciales inválidas'
-      });
-    }
-
-    // Verificar contraseña
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-    if (!isPasswordValid) {
-      return res.status(401).json({
-        error: 'Credenciales inválidas'
-      });
-    }
-
-    // Actualizar último login
-    await user.update({ last_login: new Date() });
-
-    // Generar token
-    const token = generateToken(user);
-
-    // Crear log de auditoría
-    await AuditLog.createLog({
-      user_id: user.id,
-      action: AUDIT_ACTIONS.LOGIN,
-      entity_type: 'User',
-      entity_id: user.id,
-      ip_address: req.ip,
-      user_agent: req.get('User-Agent'),
-      additional_info: {
-        login_time: new Date(),
-        email: user.email
-      }
-    });
-
-    // Preparar respuesta (sin incluir la contraseña)
-    const userResponse = {
-      id: user.id,
-      email: user.email,
-      first_name: user.first_name,
-      last_name: user.last_name,
-      role: user.role,
-      last_login: user.last_login,
-      doctorProfile: user.doctorProfile
+    const userInfo = {
+      ip: req.ip,
+      userAgent: req.get('User-Agent')
     };
 
+    const result = await AuthService.loginUser(email, password, userInfo);
+
     res.status(200).json({
+      success: true,
       message: 'Login exitoso',
-      token,
-      user: userResponse
+      data: {
+        user: result.user,
+        token: result.token
+      }
     });
 
   } catch (error) {
     console.error('Error en login:', error);
+    
+    if (error.message === 'Credenciales inválidas' || 
+        error.message === 'Usuario no encontrado') {
+      return res.status(401).json({
+        success: false,
+        error: 'Email o contraseña incorrectos'
+      });
+    }
+
     res.status(500).json({
+      success: false,
       error: 'Error interno del servidor'
     });
   }
 };
 
-// Logout de usuario
+/**
+ * Logout de usuario
+ * @route POST /api/v1/auth/logout
+ * @access Private
+ */
 exports.logout = async (req, res) => {
   try {
-    const userId = req.user.userId;
+    const userInfo = {
+      ip: req.ip,
+      userAgent: req.get('User-Agent')
+    };
 
-    // Crear log de auditoría
-    await AuditLog.createLog({
-      user_id: userId,
-      action: AUDIT_ACTIONS.LOGOUT,
-      entity_type: 'User',
-      entity_id: userId,
-      ip_address: req.ip,
-      user_agent: req.get('User-Agent'),
-      additional_info: {
-        logout_time: new Date()
-      }
-    });
+    const result = await AuthService.logout(req.user.userId, userInfo);
 
     res.status(200).json({
-      message: 'Logout exitoso'
+      success: true,
+      message: result.message
     });
 
   } catch (error) {
     console.error('Error en logout:', error);
     res.status(500).json({
+      success: false,
       error: 'Error interno del servidor'
     });
   }
 };
 
-// Obtener perfil del usuario actual
+/**
+ * Obtener perfil del usuario actual
+ * @route GET /api/v1/auth/profile
+ * @access Private
+ */
 exports.getProfile = async (req, res) => {
   try {
-    const userId = req.user.userId;
-
-    const user = await User.findByPk(userId, {
-      attributes: { exclude: ['password'] },
-      include: [
-        {
-          model: Doctor,
-          as: 'doctorProfile',
-          required: false
-        }
-      ]
-    });
-
-    if (!user) {
-      return res.status(404).json({
-        error: 'Usuario no encontrado'
-      });
-    }
+    const user = await AuthService.getProfile(req.user.userId);
 
     res.status(200).json({
-      user
+      success: true,
+      data: {
+        user
+      }
     });
 
   } catch (error) {
     console.error('Error al obtener perfil:', error);
+    
+    if (error.message === 'Usuario no encontrado') {
+      return res.status(404).json({
+        success: false,
+        error: error.message
+      });
+    }
+
     res.status(500).json({
+      success: false,
       error: 'Error interno del servidor'
     });
   }
 };
 
-// Cambiar contraseña
+/**
+ * Cambiar contraseña
+ * @route PUT /api/v1/auth/change-password
+ * @access Private
+ */
 exports.changePassword = async (req, res) => {
   try {
-    const userId = req.user.userId;
     const { currentPassword, newPassword } = req.body;
 
-    // Validar datos requeridos
-    if (!currentPassword || !newPassword) {
+    // Verificar errores de validación
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
       return res.status(400).json({
-        error: 'Contraseña actual y nueva contraseña son requeridas'
+        success: false,
+        error: 'Datos de entrada inválidos',
+        details: errors.array()
       });
     }
 
-    // Validar longitud de nueva contraseña
-    if (newPassword.length < 6) {
-      return res.status(400).json({
-        error: 'La nueva contraseña debe tener al menos 6 caracteres'
-      });
-    }
+    const userInfo = {
+      ip: req.ip,
+      userAgent: req.get('User-Agent')
+    };
 
-    // Buscar usuario
-    const user = await User.findByPk(userId);
-    if (!user) {
-      return res.status(404).json({
-        error: 'Usuario no encontrado'
-      });
-    }
-
-    // Verificar contraseña actual
-    const isCurrentPasswordValid = await bcrypt.compare(currentPassword, user.password);
-    if (!isCurrentPasswordValid) {
-      return res.status(400).json({
-        error: 'Contraseña actual incorrecta'
-      });
-    }
-
-    // Hashear nueva contraseña
-    const hashedNewPassword = await bcrypt.hash(newPassword, 10);
-
-    // Actualizar contraseña
-    await user.update({ password: hashedNewPassword });
-
-    // Crear log de auditoría
-    await AuditLog.createLog({
-      user_id: userId,
-      action: 'change_password',
-      entity_type: 'User',
-      entity_id: userId,
-      ip_address: req.ip,
-      user_agent: req.get('User-Agent'),
-      additional_info: {
-        change_time: new Date()
-      }
-    });
+    const result = await AuthService.changePassword(
+      req.user.userId,
+      currentPassword,
+      newPassword,
+      userInfo
+    );
 
     res.status(200).json({
-      message: 'Contraseña cambiada exitosamente'
+      success: true,
+      message: result.message
     });
 
   } catch (error) {
     console.error('Error al cambiar contraseña:', error);
+    
+    if (error.message === 'Usuario no encontrado' || 
+        error.message === 'Contraseña actual incorrecta' ||
+        error.message.includes('debe tener al menos')) {
+      return res.status(400).json({
+        success: false,
+        error: error.message
+      });
+    }
+
     res.status(500).json({
+      success: false,
       error: 'Error interno del servidor'
     });
   }
 };
 
-// Verificar token (middleware endpoint)
+/**
+ * Verificar token (middleware endpoint)
+ * @route GET /api/v1/auth/verify
+ * @access Private
+ */
 exports.verifyToken = async (req, res) => {
   try {
     // Si llegamos aquí, el token es válido (verificado por authMiddleware)
     res.status(200).json({
+      success: true,
       valid: true,
-      user: req.user
+      data: {
+        user: req.user
+      }
     });
   } catch (error) {
     console.error('Error al verificar token:', error);
     res.status(500).json({
+      success: false,
       error: 'Error interno del servidor'
     });
   }

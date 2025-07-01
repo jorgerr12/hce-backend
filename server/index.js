@@ -11,7 +11,10 @@ const { syncDatabase, createSeedData } = require('./models');
 // Importar middleware
 const { generalRateLimit, loginRateLimit } = require('./middleware/rateLimitMiddleware');
 
-// Importar rutas
+// Importar rutas versionadas v1
+const v1Routes = require('./routes/v1');
+
+// Importar rutas legacy (para compatibilidad)
 const authRoutes = require('./routes/authRoutes');
 const patientRoutes = require('./routes/patientRoutes');
 const appointmentRoutes = require('./routes/appointmentRoutes');
@@ -28,10 +31,24 @@ app.use(generalRateLimit);
 
 // Configuración de CORS
 app.use(cors({
+  
   origin: process.env.CORS_ORIGIN || '*',
   credentials: true
 }));
 
+app.use((req, res, next) => {
+  // Remover el charset del content-type si existe
+  if (req.headers['content-type'] && req.headers['content-type'].includes('charset=UTF-8')) {
+    req.headers['content-type'] = req.headers['content-type'].replace('; charset=UTF-8', '');
+  }
+  next();
+});
+
+app.use(express.urlencoded({ 
+  extended: true, 
+  limit: '10mb',
+  type: ['application/x-www-form-urlencoded', 'application/x-www-form-urlencoded;charset=UTF-8']
+}));
 // Middleware para parsing de JSON
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -60,41 +77,63 @@ app.get('/api', (req, res) => {
     message: 'Bienvenido a la API de HCE Salud Vital',
     version: '1.0.0',
     documentation: '/api/docs',
+    apiVersions: {
+      v1: {
+        baseUrl: '/api/v1',
+        status: 'active',
+        description: 'Versión 1 de la API con arquitectura refactorizada'
+      },
+      legacy: {
+        baseUrl: '/api',
+        status: 'deprecated',
+        description: 'Versión legacy mantenida para compatibilidad'
+      }
+    },
     endpoints: {
-      auth: {
-        login: 'POST /api/auth/login',
-        logout: 'POST /api/auth/logout',
-        profile: 'GET /api/auth/profile',
-        changePassword: 'POST /api/auth/change-password'
-      },
-      patients: {
-        list: 'GET /api/patients',
-        create: 'POST /api/patients',
-        get: 'GET /api/patients/:id',
-        update: 'PUT /api/patients/:id',
-        delete: 'DELETE /api/patients/:id',
-        search: 'GET /api/patients/search'
-      },
-      appointments: {
-        list: 'GET /api/appointments',
-        create: 'POST /api/appointments',
-        get: 'GET /api/appointments/:id',
-        update: 'PUT /api/appointments/:id',
-        cancel: 'POST /api/appointments/:id/cancel',
-        markAttended: 'POST /api/appointments/:id/mark-attended',
-        doctorDaily: 'GET /api/appointments/doctor/:doctor_id/daily'
-      },
-      external: {
-        syncAppointment: 'POST /api/external/appointments',
-        paymentStatus: 'POST /api/external/payment-status',
-        syncStatus: 'GET /api/external/appointments/:external_code/status',
-        statistics: 'GET /api/external/sync/statistics'
+      v1: {
+        auth: {
+          login: 'POST /api/v1/auth/login',
+          logout: 'POST /api/v1/auth/logout',
+          profile: 'GET /api/v1/auth/profile',
+          changePassword: 'PUT /api/v1/auth/change-password',
+          verify: 'GET /api/v1/auth/verify'
+        },
+        patients: {
+          list: 'GET /api/v1/patients',
+          create: 'POST /api/v1/patients',
+          get: 'GET /api/v1/patients/:id',
+          update: 'PUT /api/v1/patients/:id',
+          delete: 'DELETE /api/v1/patients/:id',
+          search: 'GET /api/v1/patients/search'
+        },
+        appointments: {
+          list: 'GET /api/v1/appointments',
+          create: 'POST /api/v1/appointments',
+          get: 'GET /api/v1/appointments/:id',
+          update: 'PUT /api/v1/appointments/:id',
+          changeStatus: 'PUT /api/v1/appointments/:id/status',
+          markAttended: 'PUT /api/v1/appointments/:id/attend',
+          cancel: 'DELETE /api/v1/appointments/:id',
+          availability: 'GET /api/v1/appointments/availability',
+          stats: 'GET /api/v1/appointments/stats'
+        },
+        external: {
+          syncAppointment: 'POST /api/v1/external/sync/appointment',
+          paymentStatus: 'PUT /api/v1/external/payment/status',
+          syncStats: 'GET /api/v1/external/sync/stats',
+          webhookBilling: 'POST /api/v1/external/webhook/billing',
+          webhookPacs: 'POST /api/v1/external/webhook/pacs',
+          webhookLis: 'POST /api/v1/external/webhook/lis'
+        }
       }
     }
   });
 });
 
-// Configurar rutas de la API
+// Configurar rutas versionadas v1 (principal)
+app.use('/api/v1', v1Routes);
+
+// Configurar rutas legacy (para compatibilidad hacia atrás)
 app.use("/api/auth", loginRateLimit, authRoutes);
 app.use("/api/patients", patientRoutes);
 app.use("/api/appointments", appointmentRoutes);
@@ -163,7 +202,7 @@ const startServer = async () => {
     await testConnection();
     
     // Sincronizar modelos con la base de datos
-    await syncDatabase({ alter: true });
+    //await syncDatabase({ alter: true });
     
     // Crear datos de prueba en desarrollo
     if (process.env.NODE_ENV === 'development') {

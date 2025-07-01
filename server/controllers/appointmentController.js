@@ -1,146 +1,57 @@
 // server/controllers/appointmentController.js
-const { Appointment, Patient, Doctor, User, Consultation, AuditLog } = require('../models');
-const { APPOINTMENT_STATUSES, APPOINTMENT_TYPES, AUDIT_ACTIONS } = require('../config/constants');
-const { Op } = require('sequelize');
+const AppointmentService = require('../services/appointmentService');
+const { APPOINTMENT_STATUSES, APPOINTMENT_TYPES } = require('../config/constants');
 
 // Crear una nueva cita
 exports.createAppointment = async (req, res) => {
   try {
-    const {
-      patient_id,
-      doctor_id,
-      type,
-      date_time,
-      duration_minutes = 30,
-      description,
-      external_code,
-      payment_amount,
-      payment_method,
-      notes
-    } = req.body;
+    const appointmentData = {
+      patient_id: req.body.patient_id,
+      doctor_id: req.body.doctor_id,
+      type: req.body.type,
+      date_time: req.body.date_time,
+      duration_minutes: req.body.duration_minutes || 30,
+      description: req.body.description,
+      external_code: req.body.external_code,
+      payment_amount: req.body.payment_amount,
+      payment_method: req.body.payment_method,
+      notes: req.body.notes,
+      status: req.body.payment_amount ? APPOINTMENT_STATUSES.PAID : APPOINTMENT_STATUSES.PENDING
+    };
 
-    // Validaciones básicas
-    if (!patient_id || !doctor_id || !type || !date_time) {
-      return res.status(400).json({
-        error: 'Paciente, médico, tipo y fecha/hora son requeridos'
-      });
-    }
+    const userInfo = {
+      ip: req.ip,
+      userAgent: req.get('User-Agent')
+    };
 
-    // Validar que la fecha no sea en el pasado
-    const appointmentDate = new Date(date_time);
-    if (appointmentDate < new Date()) {
-      return res.status(400).json({
-        error: 'La fecha de la cita no puede ser en el pasado'
-      });
-    }
+    const appointment = await AppointmentService.createAppointment(
+      appointmentData,
+      req.user.id,
+      userInfo
+    );
 
-    // Verificar que el paciente existe y está activo
-    const patient = await Patient.findOne({
-      where: { id: patient_id, is_active: true }
-    });
-
-    if (!patient) {
-      return res.status(404).json({
-        error: 'Paciente no encontrado'
-      });
-    }
-
-    // Verificar que el médico existe y está activo
-    const doctor = await Doctor.findOne({
-      where: { id: doctor_id, is_active: true },
-      include: [
-        {
-          model: User,
-          as: 'user',
-          where: { is_active: true }
-        }
-      ]
-    });
-
-    if (!doctor) {
-      return res.status(404).json({
-        error: 'Médico no encontrado'
-      });
-    }
-
-    // Verificar disponibilidad del médico (no debe tener otra cita en el mismo horario)
-    const conflictingAppointment = await Appointment.findOne({
-      where: {
-        doctor_id,
-        date_time: {
-          [Op.between]: [
-            new Date(appointmentDate.getTime() - (duration_minutes * 60000)),
-            new Date(appointmentDate.getTime() + (duration_minutes * 60000))
-          ]
-        },
-        status: {
-          [Op.notIn]: [APPOINTMENT_STATUSES.CANCELLED]
-        },
-        is_active: true
-      }
-    });
-
-    if (conflictingAppointment) {
-      return res.status(409).json({
-        error: 'El médico ya tiene una cita programada en ese horario'
-      });
-    }
-
-    // Crear la cita
-    const appointment = await Appointment.create({
-      patient_id,
-      doctor_id,
-      type,
-      date_time: appointmentDate,
-      duration_minutes,
-      description,
-      status: payment_amount ? APPOINTMENT_STATUSES.PAID : APPOINTMENT_STATUSES.PENDING,
-      external_code,
-      payment_amount,
-      payment_method,
-      notes
-    });
-
-    // Crear log de auditoría
-    await AuditLog.createLog({
-      user_id: req.user.userId,
-      action: AUDIT_ACTIONS.CREATE,
-      entity_type: 'Appointment',
-      entity_id: appointment.id,
-      new_data: appointment.toJSON(),
-      ip_address: req.ip,
-      user_agent: req.get('User-Agent')
-    });
-
-    // Obtener la cita con información relacionada
-    const appointmentWithDetails = await Appointment.findByPk(appointment.id, {
-      include: [
-        {
-          model: Patient,
-          as: 'patient',
-          attributes: ['id', 'first_name', 'paternal_surname', 'maternal_surname', 'history_number']
-        },
-        {
-          model: Doctor,
-          as: 'doctor',
-          include: [
-            {
-              model: User,
-              as: 'user',
-              attributes: ['first_name', 'last_name']
-            }
-          ]
-        }
-      ]
-    });
+    // Obtener la cita creada con las relaciones
+    const createdAppointment = await AppointmentService.getAppointmentById(appointment.id);
 
     res.status(201).json({
       message: 'Cita creada exitosamente',
-      appointment: appointmentWithDetails
+      appointment: createdAppointment
     });
 
   } catch (error) {
     console.error('Error al crear cita:', error);
+    
+    if (error.message.includes('requeridos') || 
+        error.message.includes('pasado') ||
+        error.message.includes('no encontrado') ||
+        error.message.includes('inactivo')) {
+      return res.status(400).json({ error: error.message });
+    }
+    
+    if (error.message.includes('no está disponible')) {
+      return res.status(409).json({ error: error.message });
+    }
+    
     res.status(500).json({
       error: 'Error interno del servidor'
     });
@@ -150,89 +61,20 @@ exports.createAppointment = async (req, res) => {
 // Obtener lista de citas con filtros y paginación
 exports.getAppointments = async (req, res) => {
   try {
-    const {
-      page = 1,
-      limit = 20,
-      doctor_id,
-      patient_id,
-      status,
-      type,
-      date_from,
-      date_to,
-      is_active = true
-    } = req.query;
+    const filters = {
+      page: req.query.page || 1,
+      limit: req.query.limit || 20,
+      doctor_id: req.query.doctor_id,
+      patient_id: req.query.patient_id,
+      status: req.query.status,
+      type: req.query.type,
+      date_from: req.query.date_from,
+      date_to: req.query.date_to
+    };
 
-    const offset = (page - 1) * limit;
-    const whereClause = { is_active };
+    const result = await AppointmentService.getAppointments(filters);
 
-    // Agregar filtros
-    if (doctor_id) {
-      whereClause.doctor_id = doctor_id;
-    }
-
-    if (patient_id) {
-      whereClause.patient_id = patient_id;
-    }
-
-    if (status) {
-      whereClause.status = status;
-    }
-
-    if (type) {
-      whereClause.type = type;
-    }
-
-    // Filtro por rango de fechas
-    if (date_from || date_to) {
-      whereClause.date_time = {};
-      if (date_from) {
-        whereClause.date_time[Op.gte] = new Date(date_from);
-      }
-      if (date_to) {
-        whereClause.date_time[Op.lte] = new Date(date_to);
-      }
-    }
-
-    const { count, rows: appointments } = await Appointment.findAndCountAll({
-      where: whereClause,
-      limit: parseInt(limit),
-      offset: parseInt(offset),
-      order: [['date_time', 'ASC']],
-      include: [
-        {
-          model: Patient,
-          as: 'patient',
-          attributes: ['id', 'first_name', 'paternal_surname', 'maternal_surname', 'history_number', 'document_number']
-        },
-        {
-          model: Doctor,
-          as: 'doctor',
-          include: [
-            {
-              model: User,
-              as: 'user',
-              attributes: ['first_name', 'last_name']
-            }
-          ]
-        },
-        {
-          model: Consultation,
-          as: 'consultation',
-          required: false,
-          attributes: ['id', 'primary_diagnosis']
-        }
-      ]
-    });
-
-    res.status(200).json({
-      appointments,
-      pagination: {
-        current_page: parseInt(page),
-        total_pages: Math.ceil(count / limit),
-        total_records: count,
-        records_per_page: parseInt(limit)
-      }
-    });
+    res.status(200).json(result);
 
   } catch (error) {
     console.error('Error al obtener citas:', error);
@@ -247,37 +89,7 @@ exports.getAppointmentById = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const appointment = await Appointment.findOne({
-      where: { id, is_active: true },
-      include: [
-        {
-          model: Patient,
-          as: 'patient'
-        },
-        {
-          model: Doctor,
-          as: 'doctor',
-          include: [
-            {
-              model: User,
-              as: 'user',
-              attributes: ['first_name', 'last_name', 'email']
-            }
-          ]
-        },
-        {
-          model: Consultation,
-          as: 'consultation',
-          required: false
-        }
-      ]
-    });
-
-    if (!appointment) {
-      return res.status(404).json({
-        error: 'Cita no encontrada'
-      });
-    }
+    const appointment = await AppointmentService.getAppointmentById(id);
 
     res.status(200).json({
       appointment
@@ -285,6 +97,11 @@ exports.getAppointmentById = async (req, res) => {
 
   } catch (error) {
     console.error('Error al obtener cita:', error);
+    
+    if (error.message.includes('no encontrada')) {
+      return res.status(404).json({ error: error.message });
+    }
+    
     res.status(500).json({
       error: 'Error interno del servidor'
     });
@@ -297,74 +114,17 @@ exports.updateAppointment = async (req, res) => {
     const { id } = req.params;
     const updateData = req.body;
 
-    const appointment = await Appointment.findOne({
-      where: { id, is_active: true }
-    });
+    const userInfo = {
+      ip: req.ip,
+      userAgent: req.get('User-Agent')
+    };
 
-    if (!appointment) {
-      return res.status(404).json({
-        error: 'Cita no encontrada'
-      });
-    }
-
-    // Verificar si la cita puede ser modificada
-    if (appointment.status === APPOINTMENT_STATUSES.ATTENDED) {
-      return res.status(400).json({
-        error: 'No se puede modificar una cita que ya fue atendida'
-      });
-    }
-
-    // Guardar datos anteriores para auditoría
-    const oldData = appointment.toJSON();
-
-    // Validar nueva fecha si se está cambiando
-    if (updateData.date_time) {
-      const newDate = new Date(updateData.date_time);
-      if (newDate < new Date()) {
-        return res.status(400).json({
-          error: 'La nueva fecha no puede ser en el pasado'
-        });
-      }
-
-      // Verificar disponibilidad del médico si se cambia la fecha
-      const conflictingAppointment = await Appointment.findOne({
-        where: {
-          doctor_id: updateData.doctor_id || appointment.doctor_id,
-          date_time: {
-            [Op.between]: [
-              new Date(newDate.getTime() - ((updateData.duration_minutes || appointment.duration_minutes) * 60000)),
-              new Date(newDate.getTime() + ((updateData.duration_minutes || appointment.duration_minutes) * 60000))
-            ]
-          },
-          status: {
-            [Op.notIn]: [APPOINTMENT_STATUSES.CANCELLED]
-          },
-          is_active: true,
-          id: { [Op.ne]: id }
-        }
-      });
-
-      if (conflictingAppointment) {
-        return res.status(409).json({
-          error: 'El médico ya tiene una cita programada en ese horario'
-        });
-      }
-    }
-
-    // Actualizar la cita
-    await appointment.update(updateData);
-
-    // Crear log de auditoría
-    await AuditLog.createLog({
-      user_id: req.user.userId,
-      action: AUDIT_ACTIONS.UPDATE,
-      entity_type: 'Appointment',
-      entity_id: appointment.id,
-      old_data: oldData,
-      new_data: appointment.toJSON(),
-      ip_address: req.ip,
-      user_agent: req.get('User-Agent')
-    });
+    const appointment = await AppointmentService.updateAppointment(
+      id,
+      updateData,
+      req.user.id,
+      userInfo
+    );
 
     res.status(200).json({
       message: 'Cita actualizada exitosamente',
@@ -373,6 +133,20 @@ exports.updateAppointment = async (req, res) => {
 
   } catch (error) {
     console.error('Error al actualizar cita:', error);
+    
+    if (error.message.includes('no encontrada')) {
+      return res.status(404).json({ error: error.message });
+    }
+    
+    if (error.message.includes('pasado') || 
+        error.message.includes('ya fue atendida')) {
+      return res.status(400).json({ error: error.message });
+    }
+    
+    if (error.message.includes('no está disponible')) {
+      return res.status(409).json({ error: error.message });
+    }
+    
     res.status(500).json({
       error: 'Error interno del servidor'
     });
@@ -385,57 +159,35 @@ exports.cancelAppointment = async (req, res) => {
     const { id } = req.params;
     const { reason } = req.body;
 
-    const appointment = await Appointment.findOne({
-      where: { id, is_active: true }
-    });
+    const userInfo = {
+      ip: req.ip,
+      userAgent: req.get('User-Agent')
+    };
 
-    if (!appointment) {
-      return res.status(404).json({
-        error: 'Cita no encontrada'
-      });
-    }
-
-    // Verificar si la cita puede ser cancelada
-    if (appointment.status === APPOINTMENT_STATUSES.ATTENDED) {
-      return res.status(400).json({
-        error: 'No se puede cancelar una cita que ya fue atendida'
-      });
-    }
-
-    if (!appointment.canBeCancelled()) {
-      return res.status(400).json({
-        error: 'No se puede cancelar la cita con menos de 2 horas de anticipación'
-      });
-    }
-
-    // Guardar datos anteriores para auditoría
-    const oldData = appointment.toJSON();
-
-    // Cancelar la cita
-    await appointment.update({
-      status: APPOINTMENT_STATUSES.CANCELLED,
-      notes: reason ? `${appointment.notes || ''}\nMotivo de cancelación: ${reason}` : appointment.notes
-    });
-
-    // Crear log de auditoría
-    await AuditLog.createLog({
-      user_id: req.user.userId,
-      action: 'cancel',
-      entity_type: 'Appointment',
-      entity_id: appointment.id,
-      old_data: oldData,
-      new_data: appointment.toJSON(),
-      ip_address: req.ip,
-      user_agent: req.get('User-Agent'),
-      additional_info: { reason }
-    });
+    const appointment = await AppointmentService.cancelAppointment(
+      id,
+      reason,
+      req.user.id,
+      userInfo
+    );
 
     res.status(200).json({
-      message: 'Cita cancelada exitosamente'
+      message: 'Cita cancelada exitosamente',
+      appointment
     });
 
   } catch (error) {
     console.error('Error al cancelar cita:', error);
+    
+    if (error.message.includes('no encontrada')) {
+      return res.status(404).json({ error: error.message });
+    }
+    
+    if (error.message.includes('ya está cancelada') ||
+        error.message.includes('ya fue atendida')) {
+      return res.status(400).json({ error: error.message });
+    }
+    
     res.status(500).json({
       error: 'Error interno del servidor'
     });
@@ -447,48 +199,34 @@ exports.markAsAttended = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const appointment = await Appointment.findOne({
-      where: { id, is_active: true }
-    });
+    const userInfo = {
+      ip: req.ip,
+      userAgent: req.get('User-Agent')
+    };
 
-    if (!appointment) {
-      return res.status(404).json({
-        error: 'Cita no encontrada'
-      });
-    }
-
-    if (appointment.status === APPOINTMENT_STATUSES.ATTENDED) {
-      return res.status(400).json({
-        error: 'La cita ya está marcada como atendida'
-      });
-    }
-
-    // Guardar datos anteriores para auditoría
-    const oldData = appointment.toJSON();
-
-    // Marcar como atendida
-    await appointment.update({
-      status: APPOINTMENT_STATUSES.ATTENDED
-    });
-
-    // Crear log de auditoría
-    await AuditLog.createLog({
-      user_id: req.user.userId,
-      action: 'mark_attended',
-      entity_type: 'Appointment',
-      entity_id: appointment.id,
-      old_data: oldData,
-      new_data: appointment.toJSON(),
-      ip_address: req.ip,
-      user_agent: req.get('User-Agent')
-    });
+    const appointment = await AppointmentService.markAsAttended(
+      id,
+      req.user.id,
+      userInfo
+    );
 
     res.status(200).json({
-      message: 'Cita marcada como atendida exitosamente'
+      message: 'Cita marcada como atendida exitosamente',
+      appointment
     });
 
   } catch (error) {
     console.error('Error al marcar cita como atendida:', error);
+    
+    if (error.message.includes('no encontrada')) {
+      return res.status(404).json({ error: error.message });
+    }
+    
+    if (error.message.includes('ya está marcada') ||
+        error.message.includes('cancelada')) {
+      return res.status(400).json({ error: error.message });
+    }
+    
     res.status(500).json({
       error: 'Error interno del servidor'
     });
@@ -501,29 +239,7 @@ exports.getDoctorDailyAppointments = async (req, res) => {
     const { doctor_id } = req.params;
     const { date = new Date().toISOString().split('T')[0] } = req.query;
 
-    const startOfDay = new Date(date);
-    startOfDay.setHours(0, 0, 0, 0);
-    
-    const endOfDay = new Date(date);
-    endOfDay.setHours(23, 59, 59, 999);
-
-    const appointments = await Appointment.findAll({
-      where: {
-        doctor_id,
-        date_time: {
-          [Op.between]: [startOfDay, endOfDay]
-        },
-        is_active: true
-      },
-      order: [['date_time', 'ASC']],
-      include: [
-        {
-          model: Patient,
-          as: 'patient',
-          attributes: ['id', 'first_name', 'paternal_surname', 'maternal_surname', 'history_number']
-        }
-      ]
-    });
+    const appointments = await AppointmentService.getDoctorDailySchedule(doctor_id, date);
 
     res.status(200).json({
       date,
@@ -537,4 +253,3 @@ exports.getDoctorDailyAppointments = async (req, res) => {
     });
   }
 };
-
